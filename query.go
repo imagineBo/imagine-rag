@@ -7,24 +7,37 @@ import (
 	"strings"
 )
 
-// Query sends a message and returns a streaming channel of tokens.
-// Tenant passes their conversation history fetched from their own DB.
-// Read from the channel until chunk.Done == true or the channel closes.
-// Check chunk.Err on each chunk — a non-nil Err means the stream broke.
+// Query sends a message to the RAG pipeline and returns a channel of streaming
+// tokens. The channel is closed automatically when the stream ends.
 //
-//	// fetch last 10 messages from your own DB
-//	history := db.GetLastMessages(sessionID, 10)
+// Each [StreamChunk] in the channel carries incremental text. On the final
+// chunk (Chunk.Done == true), [StreamChunk.Sources] is populated with the
+// document chunks used to produce the answer.
+//
+// Always check [StreamChunk.Err] on each iteration — a non-nil error means the
+// connection broke and the answer is incomplete.
+//
+// Passing history from your own database gives the model conversation context:
+//
+//	// Load the last N messages from your DB.
+//	history, _ := client.GetHistory(ctx, sessionID)
 //
 //	stream, err := client.Query(ctx, "How do I reset my password?", imagine.QueryOpts{
-//	    History: history,
+//	    History:   history,
+//	    SessionID: sessionID, // server appends the new pair automatically
+//	    TopK:      5,
 //	})
-//	if err != nil { ... }
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 //
 //	for chunk := range stream {
-//	    if chunk.Err != nil { ... }
+//	    if chunk.Err != nil {
+//	        log.Fatal(chunk.Err)
+//	    }
 //	    fmt.Print(chunk.Text)
 //	    if chunk.Done {
-//	        // chunk.Sources has the document chunks used to answer
+//	        fmt.Printf("\n\nSources used: %d\n", len(chunk.Sources))
 //	        break
 //	    }
 //	}
@@ -49,14 +62,23 @@ func (c *Client) Query(ctx context.Context, message string, opts QueryOpts) (<-c
 	return ch, nil
 }
 
-// QuerySync sends a message and waits for the complete answer.
-// Simpler than Query — use this when you don't need streaming.
+// QuerySync sends a message to the RAG pipeline and waits for the complete
+// answer before returning.
+//
+// Use this instead of [Client.Query] when you don't need streaming — for
+// example in background jobs, webhooks, or APIs where you return the full
+// answer in a single HTTP response.
 //
 //	resp, err := client.QuerySync(ctx, "What is the refund policy?", imagine.QueryOpts{
 //	    History: history,
 //	})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 //	fmt.Println(resp.Answer)
-//	fmt.Println(resp.Sources)
+//	for _, src := range resp.Sources {
+//	    fmt.Printf("  - %s (score: %.2f)\n", src.FileName, src.Score)
+//	}
 func (c *Client) QuerySync(ctx context.Context, message string, opts QueryOpts) (QueryResponse, error) {
 	if message == "" {
 		return QueryResponse{}, &Error{Code: ErrCodeInvalidRequest, Message: "message must not be empty"}
@@ -71,44 +93,20 @@ func (c *Client) QuerySync(ctx context.Context, message string, opts QueryOpts) 
 	return result, nil
 }
 
-// -----------------------------------------------------------------------
-// helpers
-// -----------------------------------------------------------------------
-
-type queryPayload struct {
-	Message      string    `json:"message"`
-	History      []Message `json:"history,omitempty"`
-	KBID         string    `json:"kb_id,omitempty"`
-	SystemPrompt string    `json:"system_prompt,omitempty"`
-	TopK         int       `json:"top_k,omitempty"`
-	Temperature  float64   `json:"temperature,omitempty"`
-	Stream       bool      `json:"stream"`
-}
-
-func (c *Client) buildQueryPayload(message string, opts QueryOpts, stream bool) queryPayload {
-	kbID := opts.KBID
-	if kbID == "" {
-		kbID = c.activeKBID
-	}
-	return queryPayload{
-		Message:      message,
-		History:      opts.History,
-		KBID:         kbID,
-		SystemPrompt: opts.SystemPrompt,
-		TopK:         opts.TopK,
-		Temperature:  opts.Temperature,
-		Stream:       stream,
-	}
-}
-
-// CollectStream is a convenience helper that drains a Query stream into a
-// QueryResponse. Useful when you want streaming output to the user but still
-// need the final Sources list.
+// CollectStream drains a [Client.Query] stream into a [QueryResponse].
+//
+// It is a convenience wrapper for callers that want to stream tokens to a user
+// (e.g. via WebSocket) while still getting a final QueryResponse with the full
+// assembled answer and Sources list.
 //
 //	stream, _ := client.Query(ctx, message, opts)
 //	resp, err := imagine.CollectStream(stream)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	fmt.Println("Full answer:", resp.Answer)
 func CollectStream(ch <-chan StreamChunk) (QueryResponse, error) {
-	var sb strings.Builder  // build answer text
+	var sb strings.Builder
 	var sources []Source
 	for chunk := range ch {
 		if chunk.Err != nil {
@@ -120,4 +118,38 @@ func CollectStream(ch <-chan StreamChunk) (QueryResponse, error) {
 		}
 	}
 	return QueryResponse{Answer: sb.String(), Sources: sources}, nil
+}
+
+// -----------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------
+
+// queryPayload is the request body sent to POST /v1/query.
+type queryPayload struct {
+	Message      string    `json:"message"`
+	History      []Message `json:"history,omitempty"`
+	SessionID    string    `json:"session_id,omitempty"`
+	KBID         string    `json:"kb_id,omitempty"`
+	SystemPrompt string    `json:"system_prompt,omitempty"`
+	TopK         int       `json:"top_k,omitempty"`
+	Temperature  float64   `json:"temperature,omitempty"`
+	Stream       bool      `json:"stream"`
+}
+
+// buildQueryPayload assembles a queryPayload from the public-facing QueryOpts.
+func (c *Client) buildQueryPayload(message string, opts QueryOpts, stream bool) queryPayload {
+	kbID := opts.KBID
+	if kbID == "" {
+		kbID = c.activeKBID
+	}
+	return queryPayload{
+		Message:      message,
+		History:      opts.History,
+		SessionID:    opts.SessionID,
+		KBID:         kbID,
+		SystemPrompt: opts.SystemPrompt,
+		TopK:         opts.TopK,
+		Temperature:  opts.Temperature,
+		Stream:       stream,
+	}
 }

@@ -7,15 +7,21 @@ import (
 	"time"
 )
 
-// CrawlURL starts a crawl job from seedURL and returns immediately with a jobID.
-// The server fetches pages, chunks them, and adds them to the knowledge base.
-// Use GetCrawlStatus or WaitForCrawl to track progress.
+// CrawlURL starts a crawl job that spiders a website and ingests each page
+// into a knowledge base as a separate document.
+//
+// The call returns immediately with a [CrawlJob] containing the JobID — the
+// crawl runs asynchronously on the server. Use [Client.WaitForCrawl] to block
+// until it finishes, or poll [Client.GetCrawlStatus] manually.
 //
 //	job, err := client.CrawlURL(ctx, "https://docs.acme.com", imagine.CrawlOpts{
-//	    MaxPages: 200,
-//	    MaxDepth: 4,
-//	    SameDomain: true,
+//	    MaxPages:   200,
+//	    MaxDepth:   4,
+//	    SameDomain: true, // stay on docs.acme.com
 //	})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 //	fmt.Println("crawl started:", job.JobID)
 func (c *Client) CrawlURL(ctx context.Context, seedURL string, opts CrawlOpts) (CrawlJob, error) {
 	if seedURL == "" {
@@ -38,9 +44,15 @@ func (c *Client) CrawlURL(ctx context.Context, seedURL string, opts CrawlOpts) (
 	return job, nil
 }
 
-// GetCrawlStatus returns the current state of a crawl job.
+// GetCrawlStatus fetches the current state of a crawl job without blocking.
+//
+// Check [CrawlJob.Status] to see whether the crawl is still running or has
+// reached a terminal state ("completed", "failed", or "cancelled").
 //
 //	job, err := client.GetCrawlStatus(ctx, jobID)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 //	fmt.Printf("pages done: %d / %d\n", job.PagesDone, job.PagesTotal)
 func (c *Client) GetCrawlStatus(ctx context.Context, jobID string) (CrawlJob, error) {
 	if jobID == "" {
@@ -53,15 +65,23 @@ func (c *Client) GetCrawlStatus(ctx context.Context, jobID string) (CrawlJob, er
 	return job, nil
 }
 
-// WaitForCrawl polls GetCrawlStatus every interval until the job reaches a
-// terminal state (completed, failed, or cancelled), then returns the final job.
+// WaitForCrawl polls [Client.GetCrawlStatus] at the given interval until the
+// crawl reaches a terminal state ("completed", "failed", or "cancelled"), then
+// returns the final [CrawlJob].
+//
 // Pass interval = 0 to use the default of 3 seconds.
-// The context controls the overall deadline — cancel it to stop waiting early.
+// Cancel the context to stop waiting early — the crawl itself keeps running on
+// the server; call [Client.CancelCrawl] to stop it.
+//
+//	// Wait up to 10 minutes, polling every 5 seconds.
+//	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+//	defer cancel()
 //
 //	job, err := client.WaitForCrawl(ctx, jobID, 5*time.Second)
-//	if job.Status == "completed" {
-//	    fmt.Println("crawl done, pages:", job.PagesDone)
+//	if err != nil {
+//	    log.Fatal(err) // context deadline or API error
 //	}
+//	fmt.Printf("crawl %s — %d pages ingested\n", job.Status, job.PagesDone)
 func (c *Client) WaitForCrawl(ctx context.Context, jobID string, interval time.Duration) (CrawlJob, error) {
 	if interval <= 0 {
 		interval = 3 * time.Second
@@ -84,7 +104,9 @@ func (c *Client) WaitForCrawl(ctx context.Context, jobID string, interval time.D
 }
 
 // CancelCrawl stops a running crawl job.
-// Already-ingested pages remain in the knowledge base.
+//
+// Pages that have already been fetched and ingested remain in the knowledge
+// base. Only the remaining queued pages are discarded.
 //
 //	err := client.CancelCrawl(ctx, jobID)
 func (c *Client) CancelCrawl(ctx context.Context, jobID string) error {

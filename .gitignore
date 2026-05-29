@@ -1,0 +1,29 @@
+# Compiled binaries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+example/example
+example/example.exe
+
+# Go build cache and test artifacts
+*.test
+*.out
+/dist/
+
+# Go module download cache (belongs on the machine, not in the repo)
+vendor/
+
+# Environment / secrets — never commit your API key
+.env
+.env.*
+*.key
+
+# Editor and OS artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

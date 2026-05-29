@@ -13,79 +13,130 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://api.imagine.bo"
+	// defaultTimeout is applied to every HTTP request.
+	// Use [WithTimeout] or [WithHTTPClient] to change it.
 	defaultTimeout = 30 * time.Second
-	sdkVersion     = "go/1.0.0"
+
+	// sdkVersion is sent in the X-Imagine-SDK header so the server can
+	// track which SDK version made the request.
+	sdkVersion = "go/1.0.0"
 )
 
-// Client is the main entry point. Create one with New() and reuse it.
+// Client is the entry point for all API calls.
+//
+// Create one with [New] and reuse it for the lifetime of your application —
+// it holds an HTTP connection pool and is safe for concurrent use.
 type Client struct {
 	apiKey     string
 	baseURL    string
-	activeKBID string
+	activeKBID string       // default KB used when opts.KBID is empty
 	http       *http.Client
 }
 
-// Option configures the Client.
+// Option is a functional option for [New].
+// Pass one or more options to customise the client at construction time.
 type Option func(*Client)
 
-// WithBaseURL overrides the API base URL.
-// Default: https://api.imagine.bo
+// WithBaseURL sets the base URL of your hosted imagine.bo server.
+//
+// This option is required. New panics if no base URL is provided.
+// Every API call is sent to this server, so set it once and reuse the client.
+//
+//	client := imagine.New(apiKey, imagine.WithBaseURL("https://your-server.com"))
 func WithBaseURL(url string) Option {
 	return func(c *Client) {
 		c.baseURL = strings.TrimRight(url, "/")
 	}
 }
 
-// WithTimeout sets the HTTP request timeout.
-// Default: 30s. For streaming responses use a longer timeout or 0 (no timeout).
+// WithTimeout sets the HTTP request timeout applied to every call.
+//
+// The default is 30 s. For [Query] (streaming) you may want a longer timeout
+// or 0 (no timeout) so the connection stays open for the full response stream.
+//
+//	// Never time out — useful for long-running streams.
+//	client := imagine.New(apiKey, imagine.WithTimeout(0))
 func WithTimeout(d time.Duration) Option {
 	return func(c *Client) {
 		c.http.Timeout = d
 	}
 }
 
-// WithHTTPClient replaces the underlying HTTP client entirely.
-// Useful for custom transports, proxies, or test mocks.
+// WithHTTPClient replaces the underlying [net/http.Client] entirely.
+//
+// Use this when you need a custom transport (mutual TLS, corporate proxy,
+// request signing) or want to inject a test double.
+//
+//	client := imagine.New(apiKey, imagine.WithHTTPClient(myCustomHTTPClient))
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.http = hc }
 }
 
-// WithKB sets the default knowledge base ID used when none is specified in opts.
+// WithKB sets a default knowledge base ID on the client.
+//
+// Every function that accepts [IngestOpts] or [QueryOpts] will use this KB
+// when the caller leaves the KBID field empty. You can also change the default
+// at runtime with [Client.SetActiveKB].
+//
+//	client := imagine.New(apiKey, imagine.WithKB("kb_abc123"))
 func WithKB(kbID string) Option {
 	return func(c *Client) { c.activeKBID = kbID }
 }
 
-// New creates a Client. apiKey must not be empty.
+// New creates and returns a new [Client].
 //
-//	client := imagine.New("sk-tenant-abc123")
-//	client := imagine.New("sk-abc123", imagine.WithBaseURL("https://api.myhost.com"))
+// Both apiKey and [WithBaseURL] are required — New panics if either is missing.
+// Obtain your API key from the imagine.bo dashboard.
+// All other settings are optional and can be overridden with [Option] functions.
+//
+//	client := imagine.New(
+//	    "sk-your-api-key",
+//	    imagine.WithBaseURL("https://your-server.com"),
+//	)
+//
+//	// With additional options:
+//	client := imagine.New(
+//	    "sk-your-api-key",
+//	    imagine.WithBaseURL("https://your-server.com"),
+//	    imagine.WithTimeout(60*time.Second),
+//	    imagine.WithKB("kb_abc123"),
+//	)
 func New(apiKey string, opts ...Option) *Client {
 	if apiKey == "" {
 		panic("imagine: apiKey must not be empty")
 	}
 	c := &Client{
-		apiKey:  apiKey,
-		baseURL: defaultBaseURL,
-		http:    &http.Client{Timeout: defaultTimeout},
+		apiKey: apiKey,
+		http:   &http.Client{Timeout: defaultTimeout},
 	}
 	for _, o := range opts {
 		o(c)
 	}
+	if c.baseURL == "" {
+		panic("imagine: WithBaseURL is required — pass your server URL to New()")
+	}
 	return c
 }
 
-// SetActiveKB changes the default KB at runtime.
+// SetActiveKB changes the default knowledge base ID at runtime.
+//
+// Equivalent to constructing the client with [WithKB]. Useful when you create
+// a new KB after the client was already initialised.
+//
+//	kb, _ := client.CreateKB(ctx, "Docs", imagine.KBOpts{})
+//	client.SetActiveKB(kb.KBID)
 func (c *Client) SetActiveKB(kbID string) { c.activeKBID = kbID }
 
-// GetActiveKB returns the current default KB ID.
+// GetActiveKB returns the current default knowledge base ID.
+// Returns an empty string if none has been set.
 func (c *Client) GetActiveKB() string { return c.activeKBID }
 
 // -----------------------------------------------------------------------
-// internal HTTP helpers
+// Internal HTTP helpers — not part of the public API.
 // -----------------------------------------------------------------------
 
-// do performs a JSON request and decodes the response into out.
+// do sends a JSON request and decodes the JSON response into out.
+// out may be nil if the caller does not need the response body.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	var bodyReader io.Reader
 	if body != nil {
@@ -111,7 +162,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	return c.handleResponse(resp, out)
 }
 
-// doMultipart performs a multipart/form-data request (used for file uploads).
+// doMultipart sends a multipart/form-data request (used for file uploads).
 func (c *Client) doMultipart(ctx context.Context, path string, body io.Reader, contentType string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, body)
 	if err != nil {
@@ -128,8 +179,8 @@ func (c *Client) doMultipart(ctx context.Context, path string, body io.Reader, c
 	return c.handleResponse(resp, out)
 }
 
-// doStream performs a request and returns the raw response body for SSE reading.
-// Caller is responsible for closing the body.
+// doStream sends a request and returns the raw response body for SSE reading.
+// The caller is responsible for closing the returned body.
 func (c *Client) doStream(ctx context.Context, path string, body any) (io.ReadCloser, error) {
 	b, err := json.Marshal(body)
 	if err != nil {
@@ -156,12 +207,14 @@ func (c *Client) doStream(ctx context.Context, path string, body any) (io.ReadCl
 	return resp.Body, nil
 }
 
+// setHeaders attaches the Authorization, Content-Type, and SDK version headers.
 func (c *Client) setHeaders(req *http.Request, contentType string) {
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("X-Imagine-SDK", sdkVersion)
 }
 
+// handleResponse checks the status code and decodes the JSON body into out.
 func (c *Client) handleResponse(resp *http.Response, out any) error {
 	if resp.StatusCode >= 400 {
 		return c.parseError(resp)
@@ -175,12 +228,12 @@ func (c *Client) handleResponse(resp *http.Response, out any) error {
 	return nil
 }
 
+// parseError reads an error response body and returns a populated *Error.
 func (c *Client) parseError(resp *http.Response) error {
 	apiErr := &Error{
 		StatusCode: resp.StatusCode,
 		RequestID:  resp.Header.Get("X-Request-ID"),
 	}
-	// attempt to decode structured error body
 	var body struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
@@ -189,7 +242,7 @@ func (c *Client) parseError(resp *http.Response) error {
 		apiErr.Code = body.Code
 		apiErr.Message = body.Message
 	}
-	// fill in defaults if body was not structured
+	// Fill in sensible defaults when the body was not structured JSON.
 	if apiErr.Code == "" {
 		switch resp.StatusCode {
 		case 401:
@@ -208,8 +261,9 @@ func (c *Client) parseError(resp *http.Response) error {
 	return apiErr
 }
 
-// readSSE reads Server-Sent Events from r and sends StreamChunks to ch.
-// Closes ch when done or on error.
+// readSSE reads a Server-Sent Events stream from r and sends each event as a
+// [StreamChunk] to ch. It closes ch when the stream ends or an error occurs.
+// This function is intended to run in its own goroutine.
 func readSSE(r io.Reader, ch chan<- StreamChunk) {
 	defer close(ch)
 	scanner := bufio.NewScanner(r)

@@ -7,12 +7,18 @@ import (
 	"time"
 )
 
-// ListFiles returns all files in a knowledge base.
-// Pass kbID = "" to list files across all knowledge bases for this tenant.
+// ListFiles returns all files in the specified knowledge base.
+//
+// Pass an empty kbID to list files across all knowledge bases for this tenant.
+// If kbID is empty and a default KB is set on the client ([Client.SetActiveKB]),
+// only that KB's files are returned.
 //
 //	files, err := client.ListFiles(ctx, "kb_abc123")
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 //	for _, f := range files {
-//	    fmt.Println(f.FileID, f.Name, f.Status)
+//	    fmt.Printf("%s  %-12s  %s\n", f.FileID, f.Status, f.Name)
 //	}
 func (c *Client) ListFiles(ctx context.Context, kbID string) ([]File, error) {
 	path := "/v1/files"
@@ -28,10 +34,17 @@ func (c *Client) ListFiles(ctx context.Context, kbID string) ([]File, error) {
 	return files, nil
 }
 
-// GetFileStatus returns the current state of an ingested file.
+// GetFileStatus fetches the current state of an ingested file.
+//
+// The [File.Status] field transitions from "processing" → "ready" (success) or
+// "processing" → "failed" (error). Use [Client.WaitForFile] to block until the
+// transition happens.
 //
 //	file, err := client.GetFileStatus(ctx, fileID)
-//	fmt.Println("status:", file.Status) // "processing" | "ready" | "failed"
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	fmt.Println("status:", file.Status)
 func (c *Client) GetFileStatus(ctx context.Context, fileID string) (File, error) {
 	if fileID == "" {
 		return File{}, &Error{Code: ErrCodeInvalidRequest, Message: "fileID must not be empty"}
@@ -43,15 +56,23 @@ func (c *Client) GetFileStatus(ctx context.Context, fileID string) (File, error)
 	return file, nil
 }
 
-// WaitForFile polls GetFileStatus every interval until the file reaches a
-// terminal state (ready or failed), then returns the final file record.
-// Pass interval = 0 to use the default of 2 seconds.
-// The context controls the overall deadline.
+// WaitForFile polls [Client.GetFileStatus] at the given interval until the file
+// reaches a terminal state ("ready" or "failed"), then returns the final [File].
 //
-//	file, err := client.WaitForFile(ctx, fileID, 0)
-//	if file.Status == "ready" {
-//	    fmt.Println("file is ready to query")
+// Pass interval = 0 to use the default of 2 seconds.
+// Cancel the context to stop waiting early.
+//
+//	// Ingest and wait.
+//	result, _ := client.IngestFile(ctx, "./manual.pdf", imagine.IngestOpts{})
+//
+//	file, err := client.WaitForFile(ctx, result.FileID, 0)
+//	if err != nil {
+//	    log.Fatal(err)
 //	}
+//	if file.Status == "failed" {
+//	    log.Fatal("processing failed — check the dashboard for details")
+//	}
+//	fmt.Println("file is ready:", file.Name)
 func (c *Client) WaitForFile(ctx context.Context, fileID string, interval time.Duration) (File, error) {
 	if interval <= 0 {
 		interval = 2 * time.Second
@@ -73,9 +94,15 @@ func (c *Client) WaitForFile(ctx context.Context, fileID string, interval time.D
 	}
 }
 
-// DeleteFile removes a file and all its chunks from the knowledge base.
+// DeleteFile permanently removes a file and all its indexed chunks from the
+// knowledge base. This is irreversible.
+//
+// After deletion, the file's content is no longer returned in query results.
 //
 //	err := client.DeleteFile(ctx, fileID)
+//	if err != nil && !imagine.IsNotFound(err) {
+//	    log.Fatal(err)
+//	}
 func (c *Client) DeleteFile(ctx context.Context, fileID string) error {
 	if fileID == "" {
 		return &Error{Code: ErrCodeInvalidRequest, Message: "fileID must not be empty"}

@@ -1,3 +1,3 @@
-module github.com/imaginetools/imagine-rag
+module github.com/imagineBo/imagine-rag
 
-go 1.21
+go 1.24
