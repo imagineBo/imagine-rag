@@ -195,7 +195,7 @@ type CrawlJob struct {
 	//
 	//   - "queued"    — accepted, waiting for a crawler worker
 	//   - "running"   — actively fetching pages
-	//   - "completed" — all pages processed
+	//   - "done"      — all pages processed
 	//   - "failed"    — crawler encountered an unrecoverable error
 	//   - "cancelled" — stopped by [Client.CancelCrawl]
 	Status string `json:"status"`

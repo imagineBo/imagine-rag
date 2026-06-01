@@ -42,7 +42,7 @@ const (
 
 	// ErrCodeNotFound is returned when the requested resource (KB, file, session)
 	// does not exist or has already been deleted.
-	ErrCodeNotFound = "not_found"
+	ErrCodeNotFound = "NOT_FOUND"
 
 	// ErrCodeFileTooLarge is returned when an uploaded file exceeds the plan limit.
 	ErrCodeFileTooLarge = "file_too_large"
@@ -60,10 +60,10 @@ const (
 
 	// ErrCodeInvalidRequest is returned when the request body is missing required
 	// fields or contains invalid values.
-	ErrCodeInvalidRequest = "invalid_request"
+	ErrCodeInvalidRequest = "INVALID_REQUEST"
 
 	// ErrCodeServerError is the catch-all for unexpected 5xx responses.
-	ErrCodeServerError = "server_error"
+	ErrCodeServerError = "INTERNAL_ERROR"
 )
 
 // IsNotFound reports whether err is an [*Error] with code [ErrCodeNotFound].

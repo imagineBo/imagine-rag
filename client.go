@@ -215,6 +215,7 @@ func (c *Client) setHeaders(req *http.Request, contentType string) {
 }
 
 // handleResponse checks the status code and decodes the JSON body into out.
+// The server wraps every success payload in { "success": true, "data": <payload> }.
 func (c *Client) handleResponse(resp *http.Response, out any) error {
 	if resp.StatusCode >= 400 {
 		return c.parseError(resp)
@@ -222,25 +223,34 @@ func (c *Client) handleResponse(resp *http.Response, out any) error {
 	if out == nil {
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
 		return fmt.Errorf("imagine: decode response: %w", err)
+	}
+	if err := json.Unmarshal(envelope.Data, out); err != nil {
+		return fmt.Errorf("imagine: decode data: %w", err)
 	}
 	return nil
 }
 
 // parseError reads an error response body and returns a populated *Error.
+// The server wraps errors in { "success": false, "error": { "code": "...", "message": "..." } }.
 func (c *Client) parseError(resp *http.Response) error {
 	apiErr := &Error{
 		StatusCode: resp.StatusCode,
 		RequestID:  resp.Header.Get("X-Request-ID"),
 	}
 	var body struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err == nil {
-		apiErr.Code = body.Code
-		apiErr.Message = body.Message
+		apiErr.Code = body.Error.Code
+		apiErr.Message = body.Error.Message
 	}
 	// Fill in sensible defaults when the body was not structured JSON.
 	if apiErr.Code == "" {

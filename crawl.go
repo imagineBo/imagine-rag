@@ -92,7 +92,7 @@ func (c *Client) WaitForCrawl(ctx context.Context, jobID string, interval time.D
 			return CrawlJob{}, err
 		}
 		switch job.Status {
-		case "completed", "failed", "cancelled":
+		case "done", "failed", "cancelled":
 			return job, nil
 		}
 		select {

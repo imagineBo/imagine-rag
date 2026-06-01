@@ -7,7 +7,11 @@
 
 Official Go client SDK for the [imagine.bo](https://imagine.bo) RAG platform.
 
-Build Retrieval-Augmented Generation (RAG) features — knowledge bases, document ingestion, site crawling, and AI-powered chat — without managing embeddings, vector stores, or LLM infrastructure yourself.
+The frontend **never calls the RAG server directly**. All communication goes through this library:
+
+```
+Frontend  →  Your Backend (uses this library)  →  RAG Server
+```
 
 ---
 
@@ -80,6 +84,54 @@ func main() {
     }
 }
 ```
+
+---
+
+## How the Library Calls the Server
+
+Every request the library makes goes to the RAG server over HTTP. You never need to handle this yourself — it is all done internally.
+
+### Request format
+
+```
+POST /v1/<endpoint>
+Authorization: Bearer <api-key>
+Content-Type: application/json
+X-Imagine-SDK: go/1.0.0
+```
+
+### Response envelope
+
+Every successful response from the server is wrapped in:
+
+```json
+{ "success": true, "data": <payload> }
+```
+
+The library unwraps this automatically. When you call `client.QuerySync(...)` you get back a `QueryResponse` directly — not the envelope.
+
+### Error envelope
+
+Every error response from the server looks like:
+
+```json
+{ "success": false, "error": { "code": "NOT_FOUND", "message": "..." } }
+```
+
+The library parses this into a typed `*imagine.Error` so you can handle it with the helper functions (`IsNotFound`, `IsUnauthorized`, etc.).
+
+### Streaming (SSE)
+
+For `client.Query(...)` the library sends `"stream": true` and reads the response as Server-Sent Events:
+
+```
+data: {"text":"Hello","done":false,"sources":[]}
+data: {"text":" world","done":false,"sources":[]}
+data: {"text":"","done":true,"sources":[{"file_id":"...","score":0.91,...}]}
+data: [DONE]
+```
+
+Each event is decoded into a `StreamChunk` and sent to the channel you receive.
 
 ---
 
@@ -182,7 +234,8 @@ job, err := client.CrawlURL(ctx, "https://docs.acme.com", imagine.CrawlOpts{
     SameDomain: true,
 })
 
-// Wait until the crawl completes (polls every 5 s).
+// Wait until the crawl finishes (polls every 5 s).
+// Terminal statuses: "done", "failed", "cancelled"
 done, err := client.WaitForCrawl(ctx, job.JobID, 5*time.Second)
 fmt.Printf("%d pages ingested\n", done.PagesDone)
 
@@ -192,6 +245,16 @@ status, err := client.GetCrawlStatus(ctx, job.JobID)
 // Stop a running crawl (already-ingested pages are kept).
 err = client.CancelCrawl(ctx, job.JobID)
 ```
+
+`CrawlJob.Status` values:
+
+| Value | Meaning |
+|---|---|
+| `queued` | Accepted, waiting for a crawler worker |
+| `running` | Actively fetching pages |
+| `done` | All pages processed successfully |
+| `failed` | Crawler encountered an unrecoverable error |
+| `cancelled` | Stopped by `CancelCrawl` |
 
 ---
 
@@ -225,36 +288,228 @@ resp, err = imagine.CollectStream(stream)
 
 ### Sessions
 
-The server stores the full message history per session, so your users can return to a previous chat.
+The server stores the full message history per session, so users can return to a previous chat at any time. See [Session Workflows](#session-workflows) below for detailed frontend patterns.
 
 ```go
-// 1. When a user starts a new chat — create a session and save the ID.
+// Create a session when a user starts a new chat.
 session, err := client.CreateSession(ctx, imagine.SessionOpts{Name: "Alice"})
-// → save session.SessionID to your DB
 
-// 2. When the user sends a message — load history, then query.
+// Load all messages for a session (chronological order).
 history, err := client.GetHistory(ctx, session.SessionID)
+
+// Query with session — server appends the new message pair automatically.
 resp, err := client.QuerySync(ctx, userMessage, imagine.QueryOpts{
     History:   history,
-    SessionID: session.SessionID, // server appends the new pair automatically
+    SessionID: session.SessionID,
 })
 
-// 3. List all sessions (for a "past chats" UI).
+// List all sessions for this tenant (for a "past chats" sidebar).
 sessions, err := client.ListSessions(ctx)
 
-// 4. Re-open a previous chat.
+// Re-fetch session metadata.
 session, err = client.GetSession(ctx, sessionID)
-history, err = client.GetHistory(ctx, sessionID)
 
-// 5. Clean up.
+// Delete a session and all its messages.
 err = client.DeleteSession(ctx, sessionID)
+```
+
+---
+
+## Session Workflows
+
+This section covers every session-related action a frontend user can take.
+
+### 1. User starts a new chat
+
+Call once when the user opens a fresh conversation. Save the returned `SessionID` in your own database — you will need it for every subsequent operation on this chat.
+
+```go
+session, err := client.CreateSession(ctx, imagine.SessionOpts{
+    Name:     "Support chat",                       // shown in the sidebar
+    Metadata: map[string]string{"user_id": "u_42"}, // your own data
+})
+if err != nil {
+    // handle error
+}
+
+// Persist to your DB:
+//   INSERT INTO chats (session_id, user_id, name) VALUES (?, ?, ?)
+//   session.SessionID, userID, session.Name
+```
+
+Then send the first message immediately:
+
+```go
+stream, err := client.Query(ctx, firstMessage, imagine.QueryOpts{
+    SessionID: session.SessionID, // server stores user message + reply
+})
+// stream tokens to the frontend...
+```
+
+---
+
+### 2. User opens the "Past Chats" sidebar
+
+Fetch all sessions for the current tenant, ordered by most-recently-updated first. Render each one as a row in the sidebar.
+
+```go
+sessions, err := client.ListSessions(ctx)
+if err != nil {
+    // handle error
+}
+
+// Each imagine.Session contains:
+//   session.SessionID  — use as the key when the user clicks a row
+//   session.Name       — display label
+//   session.UpdatedAt  — "last active" timestamp
+//   session.CreatedAt  — creation timestamp
+//   session.Metadata   — any extra data you stored at creation time
+
+for _, s := range sessions {
+    fmt.Printf("%s  |  %s  |  last active: %s\n",
+        s.SessionID, s.Name, s.UpdatedAt.Format("Jan 2, 2006"))
+}
+```
+
+---
+
+### 3. User opens an older session
+
+Two calls: one to get session metadata (name, timestamps) and one to load the full message history. Render the messages in chronological order, then let the user continue the conversation.
+
+```go
+// Step A — re-fetch metadata (name may have been updated, UpdatedAt reflects last activity).
+session, err := client.GetSession(ctx, sessionID)
+if err != nil {
+    if imagine.IsNotFound(err) {
+        // session was deleted — show an error in the UI
+    }
+    // handle other errors
+}
+
+// Step B — load the full message history.
+history, err := client.GetHistory(ctx, sessionID)
+if err != nil {
+    // handle error
+}
+
+// history is []imagine.Message in chronological order:
+//   []{Role:"user", Content:"..."}, {Role:"assistant", Content:"..."}}, ...
+//
+// Render each message in your chat UI.
+for _, msg := range history {
+    fmt.Printf("[%s] %s\n", msg.Role, msg.Content)
+}
+```
+
+---
+
+### 4. User sends a message in an existing session
+
+Load history first (so the model has context), then call `Query` or `QuerySync` with both `History` and `SessionID`. The server automatically appends the new user message and the assistant reply to the session — no extra call needed.
+
+```go
+// Load the latest history before each message.
+history, err := client.GetHistory(ctx, sessionID)
+if err != nil {
+    // handle error
+}
+
+// Stream the answer back to the frontend.
+stream, err := client.Query(ctx, userMessage, imagine.QueryOpts{
+    SessionID: sessionID, // persists the new pair to the session
+    History:   history,   // gives the model conversation context
+    TopK:      5,
+})
+if err != nil {
+    // handle error
+}
+
+for chunk := range stream {
+    if chunk.Err != nil {
+        // stream broke — handle error
+        break
+    }
+    // send chunk.Text to the frontend (WebSocket, SSE, etc.)
+    fmt.Print(chunk.Text)
+    if chunk.Done {
+        // chunk.Sources contains the document chunks used to answer
+        fmt.Printf("\nsources: %d\n", len(chunk.Sources))
+        break
+    }
+}
+```
+
+> If you don't need streaming (e.g. a REST endpoint returning a full answer), use `QuerySync` instead:
+>
+> ```go
+> resp, err := client.QuerySync(ctx, userMessage, imagine.QueryOpts{
+>     SessionID: sessionID,
+>     History:   history,
+> })
+> // resp.Answer — full answer string
+> // resp.Sources — document chunks used
+> ```
+
+---
+
+### 5. User deletes a session
+
+Permanently removes the session and all its stored messages. Show a confirmation dialog in the UI before calling this.
+
+```go
+err := client.DeleteSession(ctx, sessionID)
+if err != nil {
+    if imagine.IsNotFound(err) {
+        // already deleted — treat as success
+        return nil
+    }
+    // handle other errors
+}
+
+// Remove from your local state / DB, redirect to a new chat.
+```
+
+---
+
+### Complete session lifecycle (reference)
+
+```
+User action                     Library call
+──────────────────────────────────────────────────────────────────
+New chat button clicked      →  CreateSession(ctx, opts)
+                                  └─ save SessionID to your DB
+
+Sidebar opens                →  ListSessions(ctx)
+                                  └─ render session list
+
+User clicks a past chat      →  GetSession(ctx, sessionID)
+                                  └─ show name / timestamps
+                             →  GetHistory(ctx, sessionID)
+                                  └─ render message bubbles
+
+User sends a message         →  GetHistory(ctx, sessionID)   [refresh]
+                             →  Query(ctx, msg, QueryOpts{
+                                    SessionID: sessionID,
+                                    History:   history,
+                                })
+                                  └─ stream tokens to UI
+
+User deletes the chat        →  DeleteSession(ctx, sessionID)
+                                  └─ remove from sidebar
 ```
 
 ---
 
 ## Error Handling
 
-All non-2xx responses are returned as `*imagine.Error`:
+All non-2xx responses are returned as `*imagine.Error`. The server sends errors in this shape:
+
+```json
+{ "success": false, "error": { "code": "NOT_FOUND", "message": "..." } }
+```
+
+The library parses this automatically:
 
 ```go
 _, err := client.QuerySync(ctx, message, opts)
@@ -270,13 +525,26 @@ case imagine.IsRateLimited(err):
 case imagine.IsNotFound(err):
     // KB / file / session does not exist
 default:
-    // inspect the raw error
     var apiErr *imagine.Error
     if errors.As(err, &apiErr) {
-        fmt.Println(apiErr.StatusCode, apiErr.Code, apiErr.RequestID)
+        fmt.Println(apiErr.StatusCode, apiErr.Code, apiErr.Message)
+        fmt.Println("request ID:", apiErr.RequestID) // include in support reports
     }
 }
 ```
+
+### Error code constants
+
+| Constant | Server value | HTTP status |
+|---|---|---|
+| `imagine.ErrCodeUnauthorized` | `unauthorized` | 401 |
+| `imagine.ErrCodeNotFound` | `NOT_FOUND` | 404 |
+| `imagine.ErrCodeInvalidRequest` | `INVALID_REQUEST` | 400 |
+| `imagine.ErrCodeServerError` | `INTERNAL_ERROR` | 500 |
+| `imagine.ErrCodeRateLimited` | `rate_limited` | 429 |
+| `imagine.ErrCodeQuotaExceeded` | `quota_exceeded` | — |
+| `imagine.ErrCodeFileTooLarge` | `file_too_large` | — |
+| `imagine.ErrCodeUnsupportedType` | `unsupported_type` | — |
 
 ---
 
